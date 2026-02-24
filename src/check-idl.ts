@@ -32,12 +32,14 @@ async function main() {
   const idlPda = await getIdlPda(programId);
 
   const [programUpgradeTx, idlUpgradeTx] = await Promise.all([
-    getLatestTransaction(programDataAddress.toBase58(), "ProgramData"),
+    getLatestUpgradeTransaction(programDataAddress.toBase58()),
     getLatestTransaction(idlPda.toBase58(), "IdlAccount"),
   ]);
 
   if (!programUpgradeTx) {
-    console.error("❌ No transaction history found for ProgramData.");
+    console.error(
+      "❌ No program upgrade transaction found for ProgramData (searched recent history).",
+    );
     process.exit(1);
   }
 
@@ -142,6 +144,126 @@ async function getLatestTransaction(
     console.error(`❌ Error fetching history for ${label}:`, err.message);
     throw err;
   }
+}
+
+/**
+ * Finds the latest actual program upgrade transaction for a ProgramData account.
+ * Walks backwards through transaction history, skipping non-upgrade txs
+ * (e.g. SetAuthority which also touches the ProgramData account).
+ *
+ * BPF Loader Upgradeable instruction discriminators (little-endian u32):
+ *   0 = InitializeBuffer
+ *   1 = Write
+ *   2 = DeployWithMaxDataLen
+ *   3 = Upgrade
+ *   4 = SetAuthority
+ *   5 = Close
+ *   6 = ExtendProgram
+ *   7 = SetAuthorityChecked
+ */
+const UPGRADE_DISCRIMINATOR = 3;
+const BATCH_SIZE = 10;
+const MAX_BATCHES = 10;
+
+async function getLatestUpgradeTransaction(
+  programDataAddress: string,
+): Promise<TxData | null> {
+  let before: string | undefined;
+
+  for (let batch = 0; batch < MAX_BATCHES; batch++) {
+    const sigsResponse = await fetch(process.env.RPC_URL!, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getSignaturesForAddress",
+        params: [
+          programDataAddress,
+          {
+            limit: BATCH_SIZE,
+            ...(before ? { before } : {}),
+          },
+        ],
+      }),
+    });
+
+    const sigsData = await sigsResponse.json();
+    const sigs = sigsData.result as TxData[];
+
+    if (!sigs || sigs.length === 0) {
+      return null;
+    }
+
+    // Fetch full transaction details for this batch
+    for (const sig of sigs) {
+      const txResponse = await fetch(process.env.RPC_URL!, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getTransaction",
+          params: [
+            sig.signature,
+            { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+          ],
+        }),
+      });
+
+      const txData = await txResponse.json();
+      const tx = txData.result;
+
+      if (!tx || !tx.transaction) continue;
+
+      if (isUpgradeInstruction(tx)) {
+        return sig;
+      }
+    }
+
+    before = sigs[sigs.length - 1].signature;
+  }
+
+  return null;
+}
+
+function isUpgradeInstruction(tx: any): boolean {
+  const message = tx.transaction.message;
+  const instructions = message.instructions ?? [];
+  const innerInstructions = tx.meta?.innerInstructions ?? [];
+
+  // Check top-level and inner instructions
+  const allInstructions = [
+    ...instructions,
+    ...innerInstructions.flatMap((ix: any) => ix.instructions ?? []),
+  ];
+
+  for (const ix of allInstructions) {
+    // jsonParsed: parsed BPF Loader Upgradeable instructions
+    if (
+      ix.program === "bpf-upgradeable-loader" &&
+      ix.parsed?.type === "upgrade"
+    ) {
+      return true;
+    }
+
+    // Fallback: raw instruction data against BPF Loader Upgradeable program
+    if (
+      ix.programId === BPF_LOADER_UPGRADEABLE_PROGRAM_ID.toBase58() &&
+      ix.data
+    ) {
+      try {
+        const decoded = Buffer.from(ix.data, "base64");
+        if (decoded.length >= 4 && decoded.readUInt32LE(0) === UPGRADE_DISCRIMINATOR) {
+          return true;
+        }
+      } catch {
+        // not base64, skip
+      }
+    }
+  }
+
+  return false;
 }
 
 function printReport(
